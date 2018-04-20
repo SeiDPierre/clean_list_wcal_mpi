@@ -1,0 +1,166 @@
+/* Weighting with 2 different horizontal resolutions for receiver and source */
+
+#include <math.h>
+#include <stdio.h>
+#include <assert.h>
+#include <unistd.h>
+#include <string.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include "../acal/const.h"
+#include "../acal/structwavket_A3z.h"
+
+#define MAXPHS 500000
+
+extern float pathprojectn1();
+extern void stop();
+extern void fgetrecord();
+extern int dataselector_auto();
+                 
+int main(int argc, char **argv)
+{
+int wpd,wph,wpN;
+FILE *list,*par;
+
+title_st title;
+tracehdrHH_st trace;
+tracehdrAreg_st traceA;
+packhdrbr_st packheader;
+
+float dep,thr,phr,ths,phs;
+float Depth,depth,stheta,sphi,rtheta,rphi;
+float disress,disresr,depres;    /* distance resolution (source, receiver) and depth resolution */
+char string[120];
+int nread,thsize,phsize,ndata,phase,p,ifphase;
+float rwgt,prj,contrib,ddep,dist;
+float vdep[MAXPHS],vths[MAXPHS],vphs[MAXPHS],vthr[MAXPHS],vphr[MAXPHS];
+int vp[MAXPHS];
+int i,nphase;
+
+  strcpy(string,argv[1]);
+  strcpy(&string[8],".wpH\0");
+  wph=open(string,0);
+  string[11]='d';
+  wpd=open(string,2);
+  string[11]='N';
+  wpN=open(string,0);
+  
+  read(wph,&title,sizeof(title));
+  printf("             Event = %s\n",string);
+  
+  Depth=title.depth;
+  stheta=title.theta;
+  sphi=title.phi;
+  if (sphi<0.0) sphi+=2.*PI;
+
+  if ((par=fopen("lu_wcal.par","r"))==NULL) 
+    stop("wcal_auto1: cannot open wcal.par");
+  fgetrecord(par,string); sscanf(string,"%f",&disress);
+  fgetrecord(par,string); sscanf(string,"%f",&disresr);
+  fgetrecord(par,string); sscanf(string,"%f",&depres);
+  
+  if ((list=fopen("lu_phase.lst","r"))==NULL) 
+    stop("wcal_auto1: cannot open phase.lst");
+  i=0;
+  while (fscanf(list,"%f %f %f %f %f %d",&vdep[i],&vths[i],&vphs[i],&vthr[i],&vphr[i],&vp[i])!=EOF) {
+     if (vphs[i]<0.0) vphs[i]+=2.*PI; 
+     if (vphr[i]<0.0) vphr[i]+=2.*PI; 
+     i++;
+     if (!i%1000) printf("i %d ",i);
+  }
+  printf("phase.lst read\n");
+  fclose(list);
+
+  nphase=i; 
+  if (nphase>=MAXPHS) stop("wcal_auto1: not enough working space");
+  printf("nphase %d\n",nphase); 
+
+  thsize=sizeof(trace);
+  phsize=sizeof(packheader);
+  while (nread=read(wph,&trace,thsize)) {
+    if (nread!=thsize) stop("wcal_auto1: error reading wph file");
+    printf("Station = %.4s\n",trace.stn);
+  
+    lseek(wpN,trace.locatnA,0);  
+    read(wpN,&traceA,sizeof(traceA));     
+    if (traceA.neffkreg!=0) {
+      rtheta=trace.theta;
+      rphi=trace.phi;
+      if (rphi<0.0) rphi+=2.*PI;
+      if (lseek(wpd,trace.locatn,0)<0) stop("wcal_auto1: lseek error 0");
+      while (1) {
+        if (!(nread=read(wpd,&packheader,phsize))) break;
+        if (nread!=phsize) stop("wcal_auto1: error reading wpd file");
+        ndata=packheader.ndata;
+        if (packheader.id!=trace.id) break;
+	      if (dataselector_auto(&packheader,trace.delta,trace.netwk,trace.chnnl,trace.comp))
+      { 
+          phase=packheader.phase;
+          if (phase==121) phase=20;
+          if (phase==124) phase=40;
+      
+/* Interaction with other path */
+          rwgt=0.0;
+	  ifphase=0;
+          for (i=0;i<nphase;i++) {
+            dep=vdep[i];ths=vths[i];phs=vphs[i];thr=vthr[i];phr=vphr[i];
+            p=vp[i];
+            depth=Depth;
+            if (p<0) {dep=0.0; depth=0.0;} /* surface wave */
+            if (p==121) p=20;
+            if (p==124) p=40;
+            prj=0.0;        
+            if (p==phase) {
+	      prj=pathprojectn1(dep*1000.,ths,phs,thr,phr,
+                           depth,stheta,sphi,rtheta,rphi,depres,disresr,disress);
+	      if ((fabs((D)(rtheta-thr))<0.002) && 
+	        (fabs((D)(rphi-phr))<0.002) &&
+	        (fabs((D)(stheta-ths))<0.002) && 
+		(fabs((D)(sphi-phs))<0.002)) {
+		ifphase=1;
+	      }
+              rwgt+=prj;
+	    }
+          }
+      
+          if (ifphase==1) {
+            printf("     phase=%4d       eff number of traces = %5.2f\n",
+                packheader.phase,rwgt);
+	    if (rwgt==0.0) {
+	      printf("stheta %f sphi %f rtheta %f rphi %f\n",stheta,sphi,rtheta,rphi);
+	      stop("wcal_auto1: lseek error 0");            
+            }
+            rwgt=sqrt(rwgt);
+            rwgt*=packheader.rmsd*ndata; /* one packet one datum */
+            rwgt/=sqrt((D)(ndata*trace.smplintv));
+            packheader.weight=1./rwgt;
+	    if (packheader.weight>1e10) {
+	    /* To avoid the model being influenced by few phases with a weight much higher than the average */
+	      packheader.weight=1e10;
+              printf("Warning: weight for %d is large!\n",p);
+	    }
+	  } 
+	  
+          if (lseek(wpd,(off_t)(-phsize),1)<0) stop("wcal_auto1: lseek error 1");
+          if (write(wpd,&packheader,phsize)!=phsize) 
+            stop("wcal_auto1: writing error");
+        }
+        if (lseek(wpd,(off_t)(4*ndata),1)<0) stop("wcal_auto1: lseek error 2");
+      }
+    } else {
+      if (lseek(wpd,trace.locatn,0)<0) stop("wcal_auto1: lseek error 0");
+      while (1) {
+        if (!(nread=read(wpd,&packheader,phsize))) break;
+        if (nread!=phsize) stop("wcal_auto1: error reading wpd file");
+        if (packheader.id!=trace.id) break;
+        packheader.weight=0.;
+        ndata=packheader.ndata;
+        if (lseek(wpd,(off_t)(-phsize),1)<0) stop("wcal_auto1: lseek error 1");
+        if (write(wpd,&packheader,phsize)!=phsize) 
+           stop("wcal_auto1: writing error");
+        if (lseek(wpd,(off_t)(4*ndata),1)<0) stop("wcal_auto1: lseek error 2");
+      }
+    }
+  }
+}
+
